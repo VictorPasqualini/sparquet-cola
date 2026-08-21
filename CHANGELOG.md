@@ -4,7 +4,7 @@ All notable changes to `sparquet-cola` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] - 2026-08-20
+## [0.2.0] - 2026-08-21
 
 ### Added
 
@@ -29,6 +29,11 @@ All notable changes to `sparquet-cola` are documented here. The format follows
 - `Cola.codes(rules)` — the code of each rule, in order. Lets a caller discover what it
   can scope or filter a quarantine by before running the split.
 
+- `tests/test_split_spark.py`: integration tests that run `split` against a local
+  SparkSession (the regression above cannot be caught without one). They skip cleanly
+  when no working Java/Spark is available, and are wired into both GitHub Actions
+  workflows.
+
 ### Unchanged
 
 - Split semantics: a row is invalid when it violates any row-level check,
@@ -36,9 +41,10 @@ All notable changes to `sparquet-cola` are documented here. The format follows
   aggregate-only rule lists leave everything valid, and the internal flag column never
   leaks into either output.
 
-## [0.1.1] - 2026-08-20
-
 ### Fixed
+
+> Shipped as part of this release: 0.1.1 was tagged in the changelog but never
+> published to PyPI, so its fix reaches users here.
 
 - `Cola.split(df, rules)` no longer crashes when the rule list contains a `unique`
   check. `UniqueCheck.violation()` returns a window expression
@@ -50,12 +56,6 @@ All notable changes to `sparquet-cola` are documented here. The format follows
   Row-level semantics are unchanged (a row is invalid when it violates any row-level
   check; a `NULL` comparison does not invalidate a row).
 
-### Added
-
-- `tests/test_split_spark.py`: integration tests that run `split` against a local
-  SparkSession (the regression above cannot be caught without one). They skip cleanly
-  when no working Java/Spark is available, and are wired into both GitHub Actions
-  workflows.
 
 ## [0.1.0] - 2026-08-16
 
