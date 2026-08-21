@@ -81,6 +81,33 @@ def _code_columns(params: dict) -> str:
     return "" if column is None else str(column)
 
 
+def _columns_of(params: dict, check_type: str, required: bool = True) -> List[str]:
+    """Colunas de uma regra multi-coluna, aceitando `columns` OU `column`.
+
+    O `column` singular não é só conveniência: com `targets`, a forma natural de
+    declarar um alvo é `{"column": "id"}` — é o que `range` e `regex` usam —, e
+    `_code_columns` já derivava o código a partir das duas formas. Sem isto,
+    `not_null` renderizava `not_null(id)` no relatório e quebrava com um
+    `KeyError: 'columns'` sem contexto ao rodar.
+
+    `required=False` devolve lista vazia em vez de levantar: as métricas de frame
+    inteiro (`row_count`) legitimamente não têm coluna.
+    """
+    columns = params.get("columns")
+    if isinstance(columns, str):
+        return [columns]
+    if columns:
+        return list(columns)
+    column = params.get("column")
+    if column:
+        return [column]
+    if not required:
+        return []
+    raise ValueError(
+        f"Regra {check_type!r} sem coluna: declare 'columns' (lista) ou 'column'."
+    )
+
+
 class BaseCheck:
     """Contrato de um check.
 
@@ -153,7 +180,7 @@ class NotNullCheck(BaseCheck):
         return f"not_null({_code_columns(self.params)})"
 
     def run(self, df: DataFrame) -> CheckResult:
-        columns: List[str] = self.params["columns"]
+        columns = _columns_of(self.params, "not_null")
         violations = {}
         for col in columns:
             count = df.filter(F.col(col).isNull()).count()
@@ -168,7 +195,7 @@ class NotNullCheck(BaseCheck):
         return CheckResult("not_null", True, check_name=self._name())
 
     def violation(self, df: DataFrame) -> Column:
-        cols = self.params["columns"]
+        cols = _columns_of(self.params, "not_null")
         cond = F.col(cols[0]).isNull()
         for c in cols[1:]:
             cond = cond | F.col(c).isNull()
@@ -182,7 +209,7 @@ class UniqueCheck(BaseCheck):
         return f"unique({_code_columns(self.params)})"
 
     def run(self, df: DataFrame) -> CheckResult:
-        columns: List[str] = self.params["columns"]
+        columns = _columns_of(self.params, "unique")
         total = df.count()
         distinct = df.select(*columns).distinct().count()
         duplicates = total - distinct
@@ -195,7 +222,7 @@ class UniqueCheck(BaseCheck):
         return CheckResult("unique", True, check_name=self._name())
 
     def violation(self, df: DataFrame) -> Column:
-        cols = [F.col(c) for c in self.params["columns"]]
+        cols = [F.col(c) for c in _columns_of(self.params, "unique")]
         return F.count(F.lit(1)).over(Window.partitionBy(*cols)) > 1
 
 
@@ -362,6 +389,27 @@ _NUMERIC_AGGS = {
     "min": F.min, "max": F.max, "avg": F.avg, "mean": F.avg, "sum": F.sum, "stddev": F.stddev,
 }
 
+#: Toda métrica é um `type` de regra. `{"type": "missing_percent", "column": "cpf",
+#: "must_be": "< 1%"}` — sem wrapper. As row-level (missing_*/invalid_*) sabem apontar
+#: a linha, então entram na quarentena; as agregadas descrevem a tabela e não entram.
+METRIC_TYPES = (
+    "row_count",
+    "distinct_count",
+    "missing_count",
+    "missing_percent",
+    "duplicate_count",
+    "duplicate_percent",
+    "invalid_count",
+    "invalid_percent",
+    "min",
+    "max",
+    "avg",
+    "mean",
+    "sum",
+    "stddev",
+    "freshness",
+)
+
 
 def _named_format(name: Optional[str]) -> Optional[str]:
     if name is None:
@@ -395,17 +443,17 @@ def evaluate_check(metric, value, failed_count, must_be, warn, name="", column_l
 
     if not must_be.satisfies(value):
         return CheckResult(
-            "check", False, f"{label} = {shown} viola must_be ({must_be.describe()})",
+            metric, False, f"{label} = {shown} viola must_be ({must_be.describe()})",
             failed_count, severity="fail", metric_value=value, check_name=name,
         )
     if warn is not None and not warn.satisfies(value):
         return CheckResult(
-            "check", True,
+            metric, True,
             f"{label} = {shown} passa must_be ({must_be.describe()}) mas viola warn ({warn.describe()})",
             failed_count, severity="warn", metric_value=value, check_name=name,
         )
     return CheckResult(
-        "check", True, f"{label} = {shown} (ok: {must_be.describe()})",
+        metric, True, f"{label} = {shown} (ok: {must_be.describe()})",
         severity="pass", metric_value=value, check_name=name,
     )
 
@@ -428,9 +476,17 @@ class MetricCheck(BaseCheck):
     def run(self, df: DataFrame) -> CheckResult:
         from sparquet_cola.thresholds import Threshold
 
-        metric = self.params.get("metric")
-        if not metric:
-            raise ValueError("check requer 'metric' (ex: row_count, missing_percent, avg, freshness).")
+        # A métrica É o tipo da regra: `{"type": "missing_percent", ...}`. Antes havia um
+        # wrapper `check` cujo único trabalho era carregar um campo `metric` — um nível
+        # de indireção que não decidia nada. `metric` explícito ainda é lido para quem
+        # registrou um check próprio herdando desta classe sob outro nome.
+        metric = self.params.get("metric") or self.check_type
+        if not metric or metric == "check":
+            raise ValueError(
+                "Declare a métrica como o tipo da regra, ex: "
+                '{"type": "missing_percent", "column": "cpf", "must_be": "< 1%"}. '
+                f"Métricas: {', '.join(METRIC_TYPES)}."
+            )
         must_be_raw = self.params.get("must_be", self.params.get("condition"))
         if must_be_raw is None:
             raise ValueError("check requer 'must_be' (threshold), ex: '> 0', 'between 10 and 20', '< 5%'.")
@@ -536,11 +592,8 @@ class MetricCheck(BaseCheck):
         return cond
 
     def _columns(self) -> List[str]:
-        if self.params.get("columns"):
-            return list(self.params["columns"])
-        if self.params.get("column"):
-            return [self.params["column"]]
-        return []
+        # Métrica de frame inteiro (row_count) não tem coluna — daí required=False.
+        return _columns_of(self.params, self.check_type, required=False)
 
     def _require_column(self, metric: str) -> str:
         column = self.params.get("column")

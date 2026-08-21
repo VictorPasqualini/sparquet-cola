@@ -7,7 +7,9 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Type
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
+from sparquet_cola.targets import expand_targets
 from sparquet_cola.checks import (
+    METRIC_TYPES,
     BaseCheck,
     CheckResult,
     MetricCheck,
@@ -22,15 +24,23 @@ from sparquet_cola.checks import (
 
 # Registry padrão: nome no JSON → classe de check. O `type` do JSON continua o mesmo
 # ("validations" → rules[].type); o branding sparquet_cola é só interno.
+#: Regras row-level com semântica própria, não expressáveis como métrica:
+#: `regex` conta NULL como violação (`~rlike | isNull`) enquanto `invalid_*` trata NULL
+#: como *missing*, outra métrica; e `range` aponta a LINHA fora do intervalo, enquanto
+#: as métricas `min`/`max` descrevem a coluna e não sabem rotular linha nenhuma.
+#: Colapsá-las em métricas mudaria o resultado em silêncio.
 _DEFAULT_CHECKS: Dict[str, Type[BaseCheck]] = {
     "not_null": NotNullCheck,
     "unique": UniqueCheck,
     "range": RangeCheck,
     "regex": RegexCheck,
-    "row_count": RowCountCheck,
     "sql": SqlCheck,
-    "check": MetricCheck,
     "schema": SchemaCheck,
+    # Toda métrica é um tipo. O antigo wrapper `check` só carregava um campo `metric`
+    # que agora é o próprio `type` — um nível de indireção que não decidia nada.
+    **{metric: MetricCheck for metric in METRIC_TYPES if metric != "row_count"},
+    # `row_count` tem mensagem própria e aceita `min`/`max` além de `must_be`.
+    "row_count": RowCountCheck,
 }
 
 
@@ -85,14 +95,34 @@ class Cola:
         cls = self._registry.get(rule_type)
         if cls is None:
             raise ValueError(f"Unknown check '{rule_type}'. Available: {self.available}")
-        if hasattr(rule, "params"):
-            return cls(rule)
-        params = {k: v for k, v in rule.items() if k != "type"}
-        return cls(params)
+        check = cls(rule) if hasattr(rule, "params") else cls(
+            {k: v for k, v in rule.items() if k != "type"}
+        )
+        # O tipo com que a regra foi declarada vira atributo de INSTÂNCIA, sombreando o
+        # de classe. Uma classe atende vários tipos — `MetricCheck` responde por todas
+        # as 15 métricas — e é isto que faz `{"type": "missing_percent"}` medir
+        # missing_percent, além de dar a `code()` o nome que o usuário escreveu.
+        check.check_type = rule_type
+        return check
+
+    @staticmethod
+    def expand(rules: Iterable[Any]) -> List[Any]:
+        """Achata `targets`: uma entrada multi-alvo vira N regras independentes.
+
+        Público porque a expansão precisa acontecer **antes** de qualquer coisa que
+        case regras com resultados por posição — o relatório do framework faz isso.
+        Pura e idempotente; `run`, `codes` e `split` já a aplicam internamente.
+        """
+        return expand_targets(rules)
 
     def run(self, df: DataFrame, rules: List[Any]) -> List[CheckResult]:
-        """Roda todos os checks e devolve um CheckResult por regra."""
-        return [self.build(rule).validate(df) for rule in rules]
+        """Roda todos os checks e devolve um CheckResult por regra.
+
+        `targets` é expandido antes, então uma regra multi-alvo devolve **um resultado
+        por alvo** — é o que preserva um código e uma linha de relatório por alvo, em
+        vez de um veredito agregado que não diz qual coluna quebrou.
+        """
+        return [self.build(rule).validate(df) for rule in expand_targets(rules)]
 
     def codes(self, rules: Iterable[Any]) -> List[str]:
         """O código de cada regra, na ordem — declarado (`code`) ou derivado.
@@ -100,7 +130,7 @@ class Cola:
         Use para descobrir com o que rotular/filtrar uma quarentena antes de rodar
         o split (é o mesmo valor que `annotate` grava na linha).
         """
-        return [self.build(rule).code() for rule in rules]
+        return [self.build(rule).code() for rule in expand_targets(rules)]
 
     def split(
         self,
@@ -130,7 +160,7 @@ class Cola:
         # (código, predicado) por regra row-level, na ordem declarada: é essa ordem
         # que aparece no array de códigos.
         violations: List[Tuple[str, Any]] = []
-        for rule in rules:
+        for rule in expand_targets(rules):
             check = self.build(rule)
             if wanted is not None and check.code() not in wanted:
                 continue

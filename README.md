@@ -41,7 +41,7 @@ cola = Cola()
 for r in cola.run(df, [
     {"type": "row_count", "min": 1},
     {"type": "not_null", "columns": ["id"]},
-    {"type": "check", "metric": "missing_percent", "column": "cpf", "must_be": "< 5%", "warn": "= 0"},
+    {"type": "missing_percent", "column": "cpf", "must_be": "< 5%", "warn": "= 0"},
     {"type": "sql", "failed_rows": "SELECT * FROM _validation_df WHERE amount < 0"},
 ]):
     print(r)   # [FAIL] check: missing_percent(cpf) = 8 violates must_be (< 5%)
@@ -49,7 +49,7 @@ for r in cola.run(df, [
 # 2) Split valid from invalid (quarantine)
 split = cola.split(df, [
     {"type": "not_null", "columns": ["id"]},
-    {"type": "check", "metric": "invalid_count", "column": "email",
+    {"type": "invalid_count", "column": "email",
      "valid_format": "email", "must_be": "= 0"},
 ])
 split.valid.write.format("delta").save(".../silver_ok")
@@ -82,7 +82,7 @@ not an exception.
 | `regex` | string column not matching a pattern (`rlike`) | yes |
 | `row_count` | guard on the DataFrame size (`min`/`max`) | no |
 | `sql` | free-form SQL over the temp view `_validation_df` — invariant (`query`) or `failed_rows` mode | no |
-| `check` | a **metric** compared to a **threshold**, SODA-style, with `warn`/`fail` levels | for `missing_*`/`invalid_*` |
+| *any metric* | `missing_percent`, `duplicate_count`, `avg`, `freshness`… — the metric IS the type, compared to a **threshold** with `warn`/`fail` levels | for `missing_*`/`invalid_*` |
 | `schema` | required/forbidden columns and expected types (a basic data contract) | no |
 
 *Row-level* checks feed the valid/invalid split; aggregate checks don't.
@@ -102,7 +102,7 @@ always renders the same string, because it lands in your data).
 | `{"type": "range", "column": "age", "min": 1, "max": 99}` | `range(age,1,99)` |
 | `{"type": "range", "column": "amount", "min": 0}` | `range(amount,0,*)` (`*` = no bound) |
 | `{"type": "regex", "column": "email", "pattern": "^.+@.+$"}` | `regex(email,^.+@.+$)` |
-| `{"type": "check", "metric": "missing_percent", "column": "cpf", ...}` | `missing_percent(cpf)` |
+| `{"type": "missing_percent", "column": "cpf", ...}` | `missing_percent(cpf)` |
 
 `split` can then write those codes next to the rejected rows, and be scoped to a subset
 of the rules:
@@ -123,13 +123,33 @@ empty by definition — built from the same predicates the split already compute
 costs no extra pass. `only` restricts both the split and the annotation to the rules
 whose code is listed; omitted, every row-level rule takes part.
 
-### `check` metrics and threshold DSL
+### One rule, many targets
+
+A rule may declare several targets, and each becomes a rule of its own — its own
+result, its own code, its own contribution to the quarantine:
+
+```python
+{"type": "regex", "targets": [
+    {"column": "document",  "pattern": "^[0-9]{11}$"},
+    {"column": "document2", "pattern": "^[0-9]{12}$"}]}
+```
+
+Keys outside `targets` are shared defaults, so `{"type": "range", "min": 0,
+"targets": [{"column": "a"}, {"column": "b", "max": 9}]}` bounds both columns below
+and only one above.
+
+Independence is the point: a single aggregated verdict would not tell you which
+column broke. Every ambiguous form is refused at parse time instead of silently
+degraded — an empty target list, a `code` on the parent (every expanded rule would
+inherit it and the quarantine annotation would stop being decidable), a nested
+`targets`.
+
+### Metrics and the threshold DSL
 
 `check` measures one metric and compares it to a threshold:
 
 ```python
-{"type": "check", "name": "cpf completeness",
- "metric": "missing_percent", "column": "cpf", "must_be": "< 1%", "warn": "= 0"}
+{"type": "missing_percent", "name": "cpf completeness", "column": "cpf", "must_be": "< 1%", "warn": "= 0"}
 ```
 
 Metrics: `row_count`, `distinct_count`, `missing_count`/`missing_percent`,
