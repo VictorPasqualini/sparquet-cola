@@ -16,8 +16,9 @@ on:
   workflow_dispatch: {}
 
 jobs:
-  # 1) Testes puros (sem Java/Spark real): rodam com pyspark instalado e valem
-  #    como portão — build/publish só acontecem se estes passarem.
+  # 1) Testes: os puros (sem Java/Spark real) mais a integração do split, que pula
+  #    sozinha se o runner não tiver Java. Valem como portão — build/publish só
+  #    acontecem se estes passarem.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -37,6 +38,7 @@ jobs:
           PYTHONPATH: .
         run: |
           python tests/test_cola_lib.py
+          python tests/test_split_spark.py
 
   # 2) Build do sdist + wheel e checagem de metadados (twine check).
   build:

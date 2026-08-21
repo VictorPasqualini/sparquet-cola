@@ -60,7 +60,8 @@ split.invalid.write.format("delta").save(".../silver_quarentena")
 | Membro | Assinatura | Retorna |
 |---|---|---|
 | `run` | `run(df, rules)` | um `CheckResult` por regra, em ordem |
-| `split` | `split(df, rules)` | um `ColaSplit(valid, invalid)` de dois DataFrames |
+| `split` | `split(df, rules, annotate=None, only=None)` | um `ColaSplit(valid, invalid)` de dois DataFrames |
+| `codes` | `codes(rules)` | o código de cada regra, em ordem |
 | `register` | `register(name, cls)` | registra um check customizado sob um `type` |
 | `available` | propriedade | lista ordenada dos tipos de check registrados |
 
@@ -87,6 +88,36 @@ retornado, não uma exceção.
 | `schema` | colunas obrigatórias/proibidas e tipos esperados (data contract básico) | não |
 
 Checks *row-level* alimentam o split válidas/inválidas; checks agregados não.
+
+### Códigos de falha por linha
+
+Uma tabela de quarentena que não diz **qual regra** rejeitou cada linha não permite
+agir. Por isso toda regra tem um **código**: o que você declara ou — quando você omite —
+a própria expressão da validação, renderizada de forma compacta e determinística (a
+mesma regra sempre gera a mesma string, porque ela vai para dentro dos seus dados).
+
+| Regra | Código |
+|---|---|
+| `{"type": "range", "column": "idade", "min": 1, "max": 99, "code": "AGE_RANGE"}` | `AGE_RANGE` |
+| `{"type": "not_null", "columns": ["email"]}` | `not_null(email)` |
+| `{"type": "unique", "columns": ["id", "dt"]}` | `unique(id,dt)` |
+| `{"type": "range", "column": "idade", "min": 1, "max": 99}` | `range(idade,1,99)` |
+| `{"type": "range", "column": "valor", "min": 0}` | `range(valor,0,*)` (`*` = sem limite) |
+| `{"type": "regex", "column": "email", "pattern": "^.+@.+$"}` | `regex(email,^.+@.+$)` |
+| `{"type": "check", "metric": "missing_percent", "column": "cpf", ...}` | `missing_percent(cpf)` |
+
+O `split` então grava esses códigos ao lado das linhas rejeitadas, e pode ser restrito a
+um subconjunto das regras:
+
+```python
+split = cola.split(df, rules, annotate="dq_codes", only=["AGE_RANGE", "not_null(email)"])
+split.invalid.select("id", "dq_codes").show(truncate=False)
+```
+
+`annotate` acrescenta uma coluna `array<string>` **somente ao `invalid`** — no `valid`
+ela seria vazia por definição — montada a partir dos mesmos predicados que o split já
+calcula, então não custa uma passada extra. `only` restringe o split e a anotação às
+regras cujo código está na lista; omitido, todas as regras row-level participam.
 
 ### Métricas do `check` e o DSL de threshold
 
@@ -156,10 +187,12 @@ persistência de relatório, a política `on_failure` e a quarentena row-level v
 ```bash
 pip install -e .
 PYTHONPATH=. python tests/test_cola_lib.py    # testes unitários puros, sem Java
+PYTHONPATH=. python tests/test_split_spark.py # integração do split; pula sem Java
 ```
 
 A publicação no PyPI é automatizada via GitHub Actions — ver
 [docs/DEPLOY_PYPI.md](docs/DEPLOY_PYPI.md).
+As mudanças de cada versão estão em [CHANGELOG.md](CHANGELOG.md).
 
 ## Licença
 

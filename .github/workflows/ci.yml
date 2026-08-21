@@ -1,7 +1,9 @@
 name: CI
 
-# Testes em cada push/PR na main. Testes puros (sem Java/Spark real), rodados numa
-# matriz de versões de Python.
+# Testes em cada push/PR na main, numa matriz de versões de Python.
+#   • test_cola_lib.py    → puros (sem Java/Spark real).
+#   • test_split_spark.py → integração do split com SparkSession local; pula
+#     sozinho (sem falhar) quando não há Java/Spark no runner.
 
 on:
   push:
@@ -33,3 +35,4 @@ jobs:
           PYTHONPATH: .
         run: |
           python tests/test_cola_lib.py
+          python tests/test_split_spark.py

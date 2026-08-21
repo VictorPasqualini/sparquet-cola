@@ -5,6 +5,12 @@ e devolve um `CheckResult`. Checks *row-level* (not_null, range, regex, unique, 
 `check` de invalidade) também sabem apontar **quais linhas** violam via `violation()`,
 o que permite o split valid/invalid (quarentena).
 
+Todo check também sabe se **identificar**: `code()` devolve o `code` declarado na regra
+ou, quando ele é omitido, a própria expressão da validação renderizada de forma
+compacta e determinística (`range(age,1,99)`, `not_null(email)`). Esse código é o que
+rotula a linha na quarentena (ver `Cola.split(..., annotate=...)`), então ele vai
+**para dentro dos dados** — a mesma regra tem de renderizar sempre a mesma string.
+
 Depende apenas de `pyspark` — pode ser extraído para uma lib independente.
 """
 from __future__ import annotations
@@ -57,6 +63,24 @@ class _RuleShim:
         self.params = params
 
 
+def _code_args(*parts: Any) -> str:
+    """Renderiza os argumentos de um código derivado: `not_null(a,b)`.
+
+    Sem espaços e sem reordenar nada: o código vai para dentro dos dados, então a
+    mesma regra tem de produzir sempre exatamente a mesma string.
+    """
+    return ",".join("" if part is None else str(part) for part in parts)
+
+
+def _code_columns(params: dict) -> str:
+    """Colunas de uma regra, na ordem declarada (`columns` ou `column`)."""
+    columns = params.get("columns")
+    if columns:
+        return _code_args(*columns)
+    column = params.get("column")
+    return "" if column is None else str(column)
+
+
 class BaseCheck:
     """Contrato de um check.
 
@@ -67,6 +91,9 @@ class BaseCheck:
     (registrados via `register_validator`) sobrescrevem `validate()` e usam
     `self.rule.params` — ambos os contratos funcionam.
     """
+
+    #: `type` do check no JSON. É o nome que abre o código derivado da regra.
+    check_type: str = ""
 
     def __init__(self, spec: Any) -> None:
         if hasattr(spec, "params"):
@@ -91,6 +118,27 @@ class BaseCheck:
         """
         return None
 
+    def code(self) -> str:
+        """Identificador desta regra — o que rotula uma linha na quarentena.
+
+        É o `code` declarado na regra quando existe; caso contrário, a própria
+        **expressão da validação** renderizada por `derived_code()`. O valor é
+        gravado nos dados (`Cola.split(..., annotate=...)`), então é determinístico:
+        a mesma regra devolve sempre a mesma string.
+        """
+        declared = self.params.get("code")
+        if isinstance(declared, str) and declared.strip():
+            return declared.strip()
+        return self.derived_code()
+
+    def derived_code(self) -> str:
+        """A expressão da regra, para quando `code` não é declarado.
+
+        Sobrescrito pelos checks *row-level* — os únicos que rotulam uma linha.
+        O default é só o `type` do check, sem argumentos.
+        """
+        return self.check_type or type(self).__name__
+
     def _name(self) -> str:
         return self.params.get("name", "")
 
@@ -99,6 +147,11 @@ class BaseCheck:
 
 
 class NotNullCheck(BaseCheck):
+    check_type = "not_null"
+
+    def derived_code(self) -> str:
+        return f"not_null({_code_columns(self.params)})"
+
     def run(self, df: DataFrame) -> CheckResult:
         columns: List[str] = self.params["columns"]
         violations = {}
@@ -123,6 +176,11 @@ class NotNullCheck(BaseCheck):
 
 
 class UniqueCheck(BaseCheck):
+    check_type = "unique"
+
+    def derived_code(self) -> str:
+        return f"unique({_code_columns(self.params)})"
+
     def run(self, df: DataFrame) -> CheckResult:
         columns: List[str] = self.params["columns"]
         total = df.count()
@@ -142,6 +200,21 @@ class UniqueCheck(BaseCheck):
 
 
 class RangeCheck(BaseCheck):
+    check_type = "range"
+
+    def derived_code(self) -> str:
+        # `*` = lado sem limite, então `range(age,1,*)` e `range(age,*,99)` são
+        # distinguíveis entre si e de `range(age,1,99)`.
+        low = self.params.get("min")
+        high = self.params.get("max")
+        return "range({})".format(
+            _code_args(
+                self.params.get("column"),
+                "*" if low is None else low,
+                "*" if high is None else high,
+            )
+        )
+
     def _condition(self) -> Optional[Column]:
         column = self.params["column"]
         min_val = self.params.get("min")
@@ -178,6 +251,15 @@ class RangeCheck(BaseCheck):
 
 
 class RegexCheck(BaseCheck):
+    check_type = "regex"
+
+    def derived_code(self) -> str:
+        # O padrão entra literal: é ele que define a regra, e encurtá-lo faria duas
+        # regras diferentes colidirem no mesmo código.
+        return "regex({})".format(
+            _code_args(self.params.get("column"), self.params.get("pattern"))
+        )
+
     def _condition(self) -> Column:
         column = self.params["column"]
         pattern = self.params["pattern"]
@@ -199,6 +281,8 @@ class RegexCheck(BaseCheck):
 
 
 class RowCountCheck(BaseCheck):
+    check_type = "row_count"
+
     def run(self, df: DataFrame) -> CheckResult:
         min_count = self.params.get("min", 0)
         max_count = self.params.get("max")
@@ -222,6 +306,8 @@ class SqlCheck(BaseCheck):
                         falha se vier alguma, e anexa o DataFrame em `result.failed_rows`
                         (roteável para um destino, ver o writer do framework).
     """
+
+    check_type = "sql"
 
     def run(self, df: DataFrame) -> CheckResult:
         view = self.params.get("view_name", "_validation_df")
@@ -329,6 +415,15 @@ def evaluate_check(metric, value, failed_count, must_be, warn, name="", column_l
 
 class MetricCheck(BaseCheck):
     """Check SODA-style: métrica + threshold (warn/fail) + configs de validade."""
+
+    check_type = "check"
+
+    def derived_code(self) -> str:
+        # Mesmo rótulo que aparece na mensagem do check (`missing_percent(cpf)`), sem
+        # espaços: quem lê a quarentena e quem lê o log veem o mesmo nome.
+        metric = str(self.params.get("metric", "")) or self.check_type
+        columns = _code_columns(self.params)
+        return f"{metric}({columns})" if columns else metric
 
     def run(self, df: DataFrame) -> CheckResult:
         from sparquet_cola.thresholds import Threshold
@@ -480,6 +575,8 @@ def _type_matches(actual: str, expected: str) -> bool:
 
 class SchemaCheck(BaseCheck):
     """Colunas obrigatórias/proibidas + tipos esperados (data contract básico)."""
+
+    check_type = "schema"
 
     def run(self, df: DataFrame) -> CheckResult:
         p = self.params

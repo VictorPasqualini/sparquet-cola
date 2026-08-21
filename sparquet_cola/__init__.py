@@ -27,6 +27,11 @@ sparquet, em qualquer job Spark:
     split.valid.write.format("delta").save(".../silver_ok")
     split.invalid.write.format("delta").save(".../silver_quarentena")
 
+    # Quarentena que diz POR QUE cada linha caiu: `annotate` acrescenta um
+    # array<string> com o código das regras violadas (só no lado inválido), e
+    # `only` restringe o split a um subconjunto de regras.
+    split = cola.split(df, rules, annotate="dq_codes", only=["not_null(id)"])
+
 No sparquet, o mesmo motor roda pelo bloco `validations` do JSON — o `type` das
 regras é idêntico ao dos exemplos acima.
 """
@@ -46,7 +51,7 @@ from sparquet_cola.checks import (
 from sparquet_cola.engine import Cola, ColaSplit
 from sparquet_cola.thresholds import Threshold, parse_number
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Cola",
