@@ -4,6 +4,69 @@ All notable changes to `sparquet-cola` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-08-21
+
+### Changed
+
+- **Every metric is a rule `type` now.** `{"type": "missing_percent", "column": "cpf",
+  "must_be": "< 1%"}` — the `check` wrapper is **gone**, not deprecated. Its only job
+  was to carry a `metric` field that is now the `type` itself: a level of indirection
+  that decided nothing. `rule_type` on the result carries the metric too, so a report
+  row says `missing_percent`, not `check`.
+
+  Migrating is mechanical: drop `"type": "check"` and promote `metric` to `type`.
+
+  Registered metric types: `row_count`, `distinct_count`, `missing_count`,
+  `missing_percent`, `duplicate_count`, `duplicate_percent`, `invalid_count`,
+  `invalid_percent`, `min`, `max`, `avg`, `mean`, `sum`, `stddev`, `freshness`.
+
+- **`not_null`, `unique`, `range`, `regex`, `sql` and `schema` stay first-class**, and
+  that is a decision backed by their semantics rather than a hesitation:
+  - `regex` counts NULL as a violation (`~rlike(pattern) | isNull`), while `invalid_*`
+    treats NULL as *missing* — a different metric. Folding one into the other would
+    quietly stop flagging NULLs.
+  - `range` labels the ROW outside the interval; the `min`/`max` metrics describe the
+    column and cannot point at a row, so the quarantine would lose those rows.
+  - `not_null` and `unique` do map exactly onto `missing_count = 0` and
+    `duplicate_count = 0`, but they read better and report per-column counts, and are
+    the names every DQ tool uses.
+
+### Added
+
+- **`targets`: one rule entry, many independent rules.** A rule may declare several
+  targets and each becomes a rule of its own — its own `CheckResult`, its own code, its
+  own contribution to the quarantine:
+
+  ```json
+  { "type": "regex", "targets": [
+      { "column": "document",  "pattern": "^[0-9]{11}$" },
+      { "column": "document2", "pattern": "^[0-9]{12}$" } ] }
+  ```
+
+  Keys outside `targets` are shared defaults. Independence is the whole point: one
+  aggregated verdict would not say which column broke.
+
+  Exposed as `Cola.expand(rules)` / `expand_targets(rules)` because the expansion must
+  run **before** anything pairs rules with results by position — the framework's
+  validation report does exactly that, and two divergent implementations would
+  desynchronise it. So there is one, here.
+
+  Every ambiguous form is refused at parse time rather than silently degraded: an empty
+  target list (it would erase the validation), a `code` on the parent (every expanded
+  rule would inherit the same one, making the quarantine annotation ambiguous), an
+  empty target, a nested `targets`, a `type` inside a target.
+
+- `METRIC_TYPES` is public, so a caller can enumerate the metrics.
+
+### Fixed
+
+- `not_null` e `unique` aceitam `column` (singular), não só `columns`. Com `targets`, a
+  forma natural de declarar um alvo é `{"column": "id"}` — é o que `range` e `regex`
+  usam — e o código derivado já renderizava `not_null(id)` a partir dela; só a execução
+  lia `params["columns"]` cru, então a regra morria com um `KeyError: 'columns'` que não
+  dizia qual regra era nem o que declarar. Passa a existir **um** leitor de colunas na
+  lib (`_columns_of`), usado também pelas métricas, com erro que nomeia a regra.
+
 ## [0.2.0] - 2026-08-21
 
 ### Added

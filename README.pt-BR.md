@@ -42,7 +42,7 @@ cola = Cola()
 for r in cola.run(df, [
     {"type": "row_count", "min": 1},
     {"type": "not_null", "columns": ["id"]},
-    {"type": "check", "metric": "missing_percent", "column": "cpf", "must_be": "< 5%", "warn": "= 0"},
+    {"type": "missing_percent", "column": "cpf", "must_be": "< 5%", "warn": "= 0"},
     {"type": "sql", "failed_rows": "SELECT * FROM _validation_df WHERE valor < 0"},
 ]):
     print(r)   # [FAIL] check: missing_percent(cpf) = 8 viola must_be (< 5%)
@@ -50,7 +50,7 @@ for r in cola.run(df, [
 # 2) Separar válidas de inválidas (quarentena)
 split = cola.split(df, [
     {"type": "not_null", "columns": ["id"]},
-    {"type": "check", "metric": "invalid_count", "column": "email",
+    {"type": "invalid_count", "column": "email",
      "valid_format": "email", "must_be": "= 0"},
 ])
 split.valid.write.format("delta").save(".../silver_ok")
@@ -84,7 +84,7 @@ retornado, não uma exceção.
 | `regex` | coluna string que não casa com um padrão (`rlike`) | sim |
 | `row_count` | guarda no tamanho do DataFrame (`min`/`max`) | não |
 | `sql` | SQL livre sobre a temp view `_validation_df` — modo invariante (`query`) ou `failed_rows` | não |
-| `check` | uma **métrica** comparada a um **threshold**, estilo SODA, com níveis `warn`/`fail` | para `missing_*`/`invalid_*` |
+| *qualquer métrica* | `missing_percent`, `duplicate_count`, `avg`, `freshness`… — a métrica É o tipo, comparada a um **threshold** com níveis `warn`/`fail` | para `missing_*`/`invalid_*` |
 | `schema` | colunas obrigatórias/proibidas e tipos esperados (data contract básico) | não |
 
 Checks *row-level* alimentam o split válidas/inválidas; checks agregados não.
@@ -104,7 +104,7 @@ mesma regra sempre gera a mesma string, porque ela vai para dentro dos seus dado
 | `{"type": "range", "column": "idade", "min": 1, "max": 99}` | `range(idade,1,99)` |
 | `{"type": "range", "column": "valor", "min": 0}` | `range(valor,0,*)` (`*` = sem limite) |
 | `{"type": "regex", "column": "email", "pattern": "^.+@.+$"}` | `regex(email,^.+@.+$)` |
-| `{"type": "check", "metric": "missing_percent", "column": "cpf", ...}` | `missing_percent(cpf)` |
+| `{"type": "missing_percent", "column": "cpf", ...}` | `missing_percent(cpf)` |
 
 O `split` então grava esses códigos ao lado das linhas rejeitadas, e pode ser restrito a
 um subconjunto das regras:
@@ -119,13 +119,32 @@ ela seria vazia por definição — montada a partir dos mesmos predicados que o
 calcula, então não custa uma passada extra. `only` restringe o split e a anotação às
 regras cujo código está na lista; omitido, todas as regras row-level participam.
 
-### Métricas do `check` e o DSL de threshold
+### Uma regra, vários alvos
+
+Uma regra pode declarar vários alvos, e cada um vira uma regra própria — com seu
+resultado, seu código e sua contribuição à quarentena:
+
+```python
+{"type": "regex", "targets": [
+    {"column": "document",  "pattern": "^[0-9]{11}$"},
+    {"column": "document2", "pattern": "^[0-9]{12}$"}]}
+```
+
+Chaves fora de `targets` são defaults compartilhados: `{"type": "range", "min": 0,
+"targets": [{"column": "a"}, {"column": "b", "max": 9}]}` limita as duas colunas por
+baixo e só uma por cima.
+
+A independência é o ponto: um veredito agregado não diria qual coluna quebrou. Toda
+forma ambígua é recusada no parse em vez de degradada em silêncio — lista de alvos
+vazia, `code` no nível do pai (todas as regras expandidas herdariam o mesmo e a
+anotação da quarentena deixaria de ser decidível), `targets` aninhado.
+
+### Métricas e o DSL de threshold
 
 O `check` mede uma métrica e compara com um threshold:
 
 ```python
-{"type": "check", "name": "completude do cpf",
- "metric": "missing_percent", "column": "cpf", "must_be": "< 1%", "warn": "= 0"}
+{"type": "missing_percent", "name": "completude do cpf", "column": "cpf", "must_be": "< 1%", "warn": "= 0"}
 ```
 
 Métricas: `row_count`, `distinct_count`, `missing_count`/`missing_percent`,

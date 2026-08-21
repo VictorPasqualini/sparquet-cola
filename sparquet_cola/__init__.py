@@ -36,6 +36,7 @@ No sparquet, o mesmo motor roda pelo bloco `validations` do JSON — o `type` da
 regras é idêntico ao dos exemplos acima.
 """
 from sparquet_cola.checks import (
+    METRIC_TYPES,
     BaseCheck,
     CheckResult,
     MetricCheck,
@@ -49,18 +50,21 @@ from sparquet_cola.checks import (
     evaluate_check,
 )
 from sparquet_cola.engine import Cola, ColaSplit
+from sparquet_cola.targets import expand_targets
 from sparquet_cola.thresholds import Threshold, parse_number
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "Cola",
     "ColaSplit",
+    "expand_targets",
     "CheckResult",
     "BaseCheck",
     "Threshold",
     "parse_number",
     "evaluate_check",
+    "METRIC_TYPES",
     # checks
     "NotNullCheck",
     "UniqueCheck",
