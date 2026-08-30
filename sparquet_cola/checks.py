@@ -16,7 +16,7 @@ Depende apenas de `pyspark` — pode ser extraído para uma lib independente.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 from pyspark.sql import Column, DataFrame
 from pyspark.sql import functions as F
@@ -145,6 +145,26 @@ class BaseCheck:
         """
         return None
 
+    def aggregations(self, df: DataFrame) -> Optional[List[Column]]:
+        """As agregações que respondem este check numa passada única sobre o df.
+
+        Um check mede com a própria action (`df.filter(...).count()`), então N
+        regras viram N varreduras. Quem sabe se exprimir como agregação devolve
+        aqui as colunas que quer medir: o motor junta as de todas as regras num
+        único `df.agg(...)` e devolve a fatia de cada uma para `from_aggregations`.
+
+        `None` — o default — mantém o check no caminho antigo, então um check
+        registrado de fora continua funcionando sem saber que isto existe.
+        """
+        return None
+
+    def from_aggregations(self, values: List[Any]) -> CheckResult:
+        """O CheckResult montado a partir do que `aggregations` pediu.
+
+        Recebe os valores já coletados, na mesma ordem das colunas pedidas.
+        """
+        raise NotImplementedError
+
     def code(self) -> str:
         """Identificador desta regra — o que rotula uma linha na quarentena.
 
@@ -180,12 +200,23 @@ class NotNullCheck(BaseCheck):
         return f"not_null({_code_columns(self.params)})"
 
     def run(self, df: DataFrame) -> CheckResult:
+        # Uma agregação por coluna, numa passada só: era um `filter().count()` por
+        # coluna, e a mensagem precisa da contagem de cada uma separadamente.
+        return self.from_aggregations(
+            list(df.agg(*self.aggregations(df)).collect()[0])
+        )
+
+    def aggregations(self, df: DataFrame) -> List[Column]:
+        return [
+            F.count(F.when(F.col(col).isNull(), F.lit(1)))
+            for col in _columns_of(self.params, "not_null")
+        ]
+
+    def from_aggregations(self, values: List[Any]) -> CheckResult:
         columns = _columns_of(self.params, "not_null")
-        violations = {}
-        for col in columns:
-            count = df.filter(F.col(col).isNull()).count()
-            if count > 0:
-                violations[col] = count
+        violations = {
+            col: int(value) for col, value in zip(columns, values) if value
+        }
         if violations:
             return CheckResult(
                 "not_null", False,
@@ -209,9 +240,21 @@ class UniqueCheck(BaseCheck):
         return f"unique({_code_columns(self.params)})"
 
     def run(self, df: DataFrame) -> CheckResult:
+        # Eram duas actions (total e distintos); a agregação faz as duas de uma vez.
+        return self.from_aggregations(
+            list(df.agg(*self.aggregations(df)).collect()[0])
+        )
+
+    def aggregations(self, df: DataFrame) -> List[Column]:
+        columns = [F.col(c) for c in _columns_of(self.params, "unique")]
+        # `count_distinct` sobre um STRUCT, e não sobre as colunas soltas: solto,
+        # ele descarta a linha em que qualquer coluna é NULL, e o `distinct().count()`
+        # que este check sempre fez conta essa combinação como um valor.
+        return [F.count(F.lit(1)), F.count_distinct(F.struct(*columns))]
+
+    def from_aggregations(self, values: List[Any]) -> CheckResult:
         columns = _columns_of(self.params, "unique")
-        total = df.count()
-        distinct = df.select(*columns).distinct().count()
+        total, distinct = int(values[0]), int(values[1])
         duplicates = total - distinct
         if duplicates > 0:
             return CheckResult(
@@ -259,10 +302,19 @@ class RangeCheck(BaseCheck):
         return cond
 
     def run(self, df: DataFrame) -> CheckResult:
-        cond = self._condition()
-        if cond is None:
+        cols = self.aggregations(df)
+        if cols is None:
             return CheckResult("range", True, check_name=self._name())
-        failed = df.filter(cond).count()
+        return self.from_aggregations(list(df.agg(*cols).collect()[0]))
+
+    def aggregations(self, df: DataFrame) -> Optional[List[Column]]:
+        cond = self._condition()
+        # Sem `min` nem `max` a regra não mede nada: fica fora da passada agregada
+        # em vez de entrar como uma coluna que ninguém lê.
+        return None if cond is None else [F.count(F.when(cond, F.lit(1)))]
+
+    def from_aggregations(self, values: List[Any]) -> CheckResult:
+        failed = int(values[0])
         if failed > 0:
             column = self.params["column"]
             return CheckResult(
@@ -293,7 +345,15 @@ class RegexCheck(BaseCheck):
         return ~F.col(column).rlike(pattern) | F.col(column).isNull()
 
     def run(self, df: DataFrame) -> CheckResult:
-        failed = df.filter(self._condition()).count()
+        return self.from_aggregations(
+            list(df.agg(*self.aggregations(df)).collect()[0])
+        )
+
+    def aggregations(self, df: DataFrame) -> List[Column]:
+        return [F.count(F.when(self._condition(), F.lit(1)))]
+
+    def from_aggregations(self, values: List[Any]) -> CheckResult:
+        failed = int(values[0])
         if failed > 0:
             return CheckResult(
                 "regex", False,
@@ -311,9 +371,17 @@ class RowCountCheck(BaseCheck):
     check_type = "row_count"
 
     def run(self, df: DataFrame) -> CheckResult:
+        return self.from_aggregations(
+            list(df.agg(*self.aggregations(df)).collect()[0])
+        )
+
+    def aggregations(self, df: DataFrame) -> List[Column]:
+        return [F.count(F.lit(1))]
+
+    def from_aggregations(self, values: List[Any]) -> CheckResult:
         min_count = self.params.get("min", 0)
         max_count = self.params.get("max")
-        count = df.count()
+        count = int(values[0])
         if count < min_count or (max_count is not None and count > max_count):
             return CheckResult(
                 "row_count", False,
@@ -474,6 +542,29 @@ class MetricCheck(BaseCheck):
         return f"{metric}({columns})" if columns else metric
 
     def run(self, df: DataFrame) -> CheckResult:
+        metric, must_be, warn = self._parametros()
+        value, failed_count = self._compute(df, metric)
+        return evaluate_check(metric, value, failed_count, must_be, warn,
+                              name=self._name(), column_label=self._column_label())
+
+    def aggregations(self, df: DataFrame) -> List[Column]:
+        # O montador fica guardado porque `from_aggregations` não recebe o df, e é
+        # dele que sai a chave de `distinct` quando a métrica não declara coluna.
+        colunas, self._montar = self._plano(df, self._parametros()[0])
+        return colunas
+
+    def from_aggregations(self, values: List[Any]) -> CheckResult:
+        metric, must_be, warn = self._parametros()
+        value, failed_count = self._montar(values)
+        return evaluate_check(metric, value, failed_count, must_be, warn,
+                              name=self._name(), column_label=self._column_label())
+
+    def _parametros(self) -> Tuple[str, Any, Any]:
+        """A métrica e os thresholds da regra, validados.
+
+        Levanta antes de qualquer Spark: uma regra sem `must_be` é erro de config,
+        e a mensagem tem de sair sem depender de o cluster estar de pé.
+        """
         from sparquet_cola.thresholds import Threshold
 
         # A métrica É o tipo da regra: `{"type": "missing_percent", ...}`. Antes havia um
@@ -492,10 +583,7 @@ class MetricCheck(BaseCheck):
             raise ValueError("check requer 'must_be' (threshold), ex: '> 0', 'between 10 and 20', '< 5%'.")
         must_be = Threshold.parse(must_be_raw)
         warn = Threshold.parse(self.params["warn"]) if self.params.get("warn") else None
-
-        value, failed_count = self._compute(df, metric)
-        return evaluate_check(metric, value, failed_count, must_be, warn,
-                              name=self._name(), column_label=self._column_label())
+        return str(metric), must_be, warn
 
     def violation(self, df: DataFrame) -> Optional[Column]:
         metric = self.params.get("metric", "")
@@ -507,47 +595,73 @@ class MetricCheck(BaseCheck):
         return None
 
     def _compute(self, df: DataFrame, metric: str) -> Tuple[Optional[float], int]:
+        colunas, montar = self._plano(df, metric)
+        return montar(list(df.agg(*colunas).collect()[0]))
+
+    def _plano(
+        self, df: DataFrame, metric: str
+    ) -> Tuple[List[Column], Callable[[List[Any]], Tuple[Optional[float], int]]]:
+        """As agregações desta métrica e a função que as lê.
+
+        É a implementação ÚNICA de cada métrica: `run` a executa sozinha e o motor
+        a junta com a das outras regras numa passada só. Duas implementações — uma
+        para cada caminho — divergiriam em silêncio no valor gravado no relatório.
+        """
         columns = self._columns()
+        total = F.count(F.lit(1))
+        # Chave de distinção: as colunas declaradas ou, sem elas, a linha inteira —
+        # o mesmo que `df.distinct()` contava. É um struct porque `count_distinct`
+        # sobre colunas soltas descarta a linha em que qualquer uma é NULL.
+        chave = F.struct(*[F.col(c) for c in (columns or df.columns)])
 
         if metric == "row_count":
-            return float(df.count()), 0
+            return [total], lambda v: (float(v[0]), 0)
+
         if metric == "distinct_count":
-            n = (df.select(*columns).distinct() if columns else df.distinct()).count()
-            return float(n), 0
+            return [F.count_distinct(chave)], lambda v: (float(v[0]), 0)
+
         if metric in ("duplicate_count", "duplicate_percent"):
-            total = df.count()
-            distinct = (df.select(*columns).distinct() if columns else df.distinct()).count()
-            dups = total - distinct
-            if metric == "duplicate_count":
-                return float(dups), dups
-            return (100.0 * dups / total if total else 0.0), dups
-        if metric in ("missing_count", "missing_percent"):
+            def duplicadas(v: List[Any]) -> Tuple[Optional[float], int]:
+                linhas, distintas = int(v[0]), int(v[1])
+                dups = linhas - distintas
+                if metric == "duplicate_count":
+                    return float(dups), dups
+                return (100.0 * dups / linhas if linhas else 0.0), dups
+
+            return [total, F.count_distinct(chave)], duplicadas
+
+        if metric in ("missing_count", "missing_percent",
+                      "invalid_count", "invalid_percent"):
             column = self._require_column(metric)
-            cnt = df.filter(self._missing_predicate(column)).count()
-            if metric == "missing_count":
-                return float(cnt), cnt
-            total = df.count()
-            return (100.0 * cnt / total if total else 0.0), cnt
-        if metric in ("invalid_count", "invalid_percent"):
-            column = self._require_column(metric)
-            invalid = ~self._missing_predicate(column) & ~self._valid_predicate(column)
-            cnt = df.filter(invalid).count()
-            if metric == "invalid_count":
-                return float(cnt), cnt
-            total = df.count()
-            return (100.0 * cnt / total if total else 0.0), cnt
+            if metric.startswith("missing"):
+                pred = self._missing_predicate(column)
+            else:
+                pred = ~self._missing_predicate(column) & ~self._valid_predicate(column)
+
+            def contadas(v: List[Any]) -> Tuple[Optional[float], int]:
+                cnt, linhas = int(v[0]), int(v[1])
+                if metric.endswith("_count"):
+                    return float(cnt), cnt
+                return (100.0 * cnt / linhas if linhas else 0.0), cnt
+
+            return [F.count(F.when(pred, F.lit(1))), total], contadas
+
         if metric == "freshness":
             column = self._require_column(metric)
-            age = df.agg(
-                (F.unix_timestamp(F.current_timestamp()) - F.unix_timestamp(F.max(F.col(column)))).alias("age")
-            ).collect()[0]["age"]
-            return (float(age) if age is not None else float("inf")), 0
+            idade = (
+                F.unix_timestamp(F.current_timestamp())
+                - F.unix_timestamp(F.max(F.col(column)))
+            )
+            return [idade], lambda v: (
+                (float(v[0]) if v[0] is not None else float("inf")), 0
+            )
 
         agg = _NUMERIC_AGGS.get(metric)
         if agg is not None:
             column = self._require_column(metric)
-            v = df.agg(agg(F.col(column)).alias("v")).collect()[0]["v"]
-            return (float(v) if v is not None else float("nan")), 0
+            return [agg(F.col(column))], lambda v: (
+                (float(v[0]) if v[0] is not None else float("nan")), 0
+            )
 
         raise ValueError(
             f"check: metric '{metric}' desconhecida. Disponiveis: row_count, distinct_count, "
