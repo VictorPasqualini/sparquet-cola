@@ -4,6 +4,46 @@ All notable changes to `sparquet-cola` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-08-30
+
+### Changed
+
+- **`Cola.run` measures the aggregable checks in a single pass.** Every check used to
+  fire its own Spark action — and more than one in the ordinary cases: `not_null` ran a
+  `filter().count()` **per column**, `unique` ran two counts, and each percent metric
+  counted the rows again for its denominator. A block of a dozen rules therefore scanned
+  the data a dozen times, re-reading the source and re-applying the whole lineage on
+  every one of them.
+
+  A check can now declare what it wants measured, and the engine measures them all
+  together:
+
+  - `BaseCheck.aggregations(df)` returns the aggregation columns this check needs, or
+    `None` — the default — to keep the old one-action-per-check path;
+  - `BaseCheck.from_aggregations(values)` builds the `CheckResult` from those values.
+
+  `run` collects the columns of every check that answered, issues **one** `df.agg(...)`,
+  and hands each check its own slice. `not_null`, `unique`, `range`, `regex`,
+  `row_count` and all 15 metrics implement it; `sql` and `schema` — and any check
+  registered from outside, which does not know this exists — still run their own action.
+  With a single aggregable check the combined pass is skipped: it would be exactly the
+  action that check would have run alone.
+
+  Results are unchanged, and that is pinned rather than asserted:
+  `tests/test_run_batch_spark.py` runs each rule alone and in a block and compares
+  verdict, message, `failed_count`, `severity` and `metric_value` field by field.
+
+  Two details the aggregation had to preserve. `unique` counts distinct values over a
+  **struct** of its columns, because `count_distinct` over bare columns drops the row
+  where any of them is NULL, while the `distinct().count()` this check always did counts
+  that combination as a value. And each metric now has a **single** implementation
+  (`MetricCheck._plano`), used both by the lone action and by the combined pass — two
+  implementations would have drifted silently in the number written to the report.
+
+  Measured through the sparquet framework, 2M rows and 5 rules (`not_null` over 4
+  columns, `unique`, `range`, `regex`, `row_count`): the validation stage went from
+  4.5s to 2.4s.
+
 ## [0.3.0] - 2026-08-21
 
 ### Changed

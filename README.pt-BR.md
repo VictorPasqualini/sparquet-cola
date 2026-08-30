@@ -193,6 +193,29 @@ cola.register("no_future_date", NoFutureDateCheck)
 cola.run(df, [{"type": "no_future_date", "column": "ordered_at"}])
 ```
 
+### Entrando na medição de passada única
+
+O `run` mede os checks nativos **juntos**, num único `df.agg(...)`, em vez de uma action
+Spark para cada um. Um check customizado continua funcionando sem saber disso — ele
+apenas roda a própria action. Para entrar na passada compartilhada, declare o que quer
+medir e leia o resultado de volta:
+
+```python
+class NoFutureDateCheck(BaseCheck):
+    def aggregations(self, df):
+        return [F.count(F.when(F.col(self.params["column"]) > F.current_date(), F.lit(1)))]
+
+    def from_aggregations(self, values):
+        failed = int(values[0])
+        if failed:
+            return CheckResult("no_future_date", False, f"{failed} future dates", failed)
+        return CheckResult("no_future_date", True)
+```
+
+Os valores voltam na ordem em que as colunas foram pedidas. Devolva `None` em
+`aggregations` para uma regra que não mede nada (um `range` sem limites, por exemplo) e o
+check fica de fora da passada.
+
 ## Dentro do Sparquet
 
 O bloco `validations` de um JSON de pipeline do

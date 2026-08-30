@@ -198,6 +198,28 @@ cola.register("no_future_date", NoFutureDateCheck)
 cola.run(df, [{"type": "no_future_date", "column": "ordered_at"}])
 ```
 
+### Joining the single-pass measurement
+
+`run` measures the built-in checks **together**, in one `df.agg(...)`, instead of one
+Spark action each. A custom check keeps working without knowing that — it just runs its
+own action. To join the shared pass, declare what you want measured and read it back:
+
+```python
+class NoFutureDateCheck(BaseCheck):
+    def aggregations(self, df):
+        return [F.count(F.when(F.col(self.params["column"]) > F.current_date(), F.lit(1)))]
+
+    def from_aggregations(self, values):
+        failed = int(values[0])
+        if failed:
+            return CheckResult("no_future_date", False, f"{failed} future dates", failed)
+        return CheckResult("no_future_date", True)
+```
+
+The values come back in the order the columns were asked for. Return `None` from
+`aggregations` for a rule that measures nothing (an unbounded `range`, say) and the check
+is left out of the pass entirely.
+
 ## Inside Sparquet
 
 The `validations` block of a [Sparquet](https://github.com/VictorPasqualini/sparquet)

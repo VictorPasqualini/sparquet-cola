@@ -121,8 +121,42 @@ class Cola:
         `targets` é expandido antes, então uma regra multi-alvo devolve **um resultado
         por alvo** — é o que preserva um código e uma linha de relatório por alvo, em
         vez de um veredito agregado que não diz qual coluna quebrou.
+
+        Os checks que sabem se exprimir como agregação (`BaseCheck.aggregations`)
+        são medidos **juntos**, numa passada só: `not_null` fazia uma action por
+        coluna e `unique` duas, então um bloco comum de regras varria os dados uma
+        dúzia de vezes. Os demais (`sql`, `schema`, um check registrado de fora)
+        continuam rodando cada um a sua.
         """
-        return [self.build(rule).validate(df) for rule in expand_targets(rules)]
+        checks = [self.build(rule) for rule in expand_targets(rules)]
+        return self._run_checks(df, checks)
+
+    def _run_checks(self, df: DataFrame, checks: List[BaseCheck]) -> List[CheckResult]:
+        colunas: List[Any] = []
+        fatias: Dict[int, Tuple[int, int]] = {}
+        for i, check in enumerate(checks):
+            pedidas = check.aggregations(df)
+            if not pedidas:
+                continue
+            inicio = len(colunas)
+            # O alias é posicional porque duas regras podem medir a mesma coisa
+            # (dois `not_null` sobre a mesma coluna) e a agg recusa nomes repetidos.
+            colunas.extend(
+                coluna.alias(f"c{i}_{j}") for j, coluna in enumerate(pedidas)
+            )
+            fatias[i] = (inicio, len(colunas))
+
+        valores: Dict[int, List[Any]] = {}
+        # Com uma única regra agregável, a passada conjunta é exatamente a action que
+        # ela faria sozinha: não vale montar o plano combinado para isso.
+        if len(fatias) > 1:
+            linha = list(df.agg(*colunas).collect()[0])
+            valores = {i: linha[inicio:fim] for i, (inicio, fim) in fatias.items()}
+
+        return [
+            check.from_aggregations(valores[i]) if i in valores else check.validate(df)
+            for i, check in enumerate(checks)
+        ]
 
     def codes(self, rules: Iterable[Any]) -> List[str]:
         """O código de cada regra, na ordem — declarado (`code`) ou derivado.

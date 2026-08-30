@@ -53,7 +53,7 @@ from sparquet_cola.engine import Cola, ColaSplit
 from sparquet_cola.targets import expand_targets
 from sparquet_cola.thresholds import Threshold, parse_number
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "Cola",
